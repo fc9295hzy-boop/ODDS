@@ -26,6 +26,9 @@ OWNER_CHAT_ID  = int(os.environ["OWNER_CHAT_ID"])
 ODDSAPIIO_KEY  = os.environ["ODDSAPIIO_KEY"]
  
 BASE_URL = "https://api.odds-api.io/v3"
+# Tes bookmakers selectionnes sur le compte (plan gratuit = 2).
+# A ajuster avec tes books reels via la variable BOOKMAKERS sur Railway.
+BOOKMAKERS = os.environ.get("BOOKMAKERS", "Bet365,Unibet")
  
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -78,41 +81,40 @@ def find_event(team_a, team_b):
 def get_odds(event_id):
     r = requests.get(f"{BASE_URL}/odds", params={
         "apiKey": ODDSAPIIO_KEY, "eventId": event_id,
+        "bookmakers": BOOKMAKERS,
     }, timeout=25)
     r.raise_for_status()
     return r.json()
  
  
 def avg_1x2(odds_json):
-    """Moyenne les cotes Match Winner (ML / 1X2) sur les bookmakers dispo."""
+    """Moyenne les cotes ML (Match Winner) sur les bookmakers dispo.
+    Structure odds-api.io confirmee :
+      odds_json['bookmakers'] = { 'Bet365': [ {'name':'ML',
+          'odds':[{'home','draw','away'}] }, ... ], ... }"""
     books = odds_json.get("bookmakers", {})
-    if isinstance(books, list):
-        # parfois liste au lieu de dict
-        iterator = books
-    else:
-        iterator = books.values()
+    if not isinstance(books, dict):
+        return None
  
     homes, draws, aways = [], [], []
-    for book in iterator:
-        markets = book if isinstance(book, list) else book.get("markets", book)
-        # 'book' peut etre une liste de marches (format odds-api.io)
-        market_list = book if isinstance(book, list) else \
-            (book.get("markets") if isinstance(book, dict) else [])
-        if not market_list and isinstance(book, list):
-            market_list = book
-        for m in (market_list or []):
-            name = str(m.get("name", "")).upper()
-            if name in ("ML", "1X2", "MATCH WINNER", "MONEYLINE"):
+    for book_name, markets in books.items():
+        if not isinstance(markets, list):
+            continue
+        for m in markets:
+            if str(m.get("name", "")).upper() == "ML":
                 for o in m.get("odds", []):
-                    if o.get("home"):
-                        homes.append(float(o["home"]))
-                    if o.get("draw"):
-                        draws.append(float(o["draw"]))
-                    if o.get("away"):
-                        aways.append(float(o["away"]))
+                    try:
+                        if o.get("home"):
+                            homes.append(float(o["home"]))
+                        if o.get("draw"):
+                            draws.append(float(o["draw"]))
+                        if o.get("away"):
+                            aways.append(float(o["away"]))
+                    except (ValueError, TypeError):
+                        pass
     if not (homes and aways):
         return None
-    avg = lambda l: sum(l)/len(l)
+    avg = lambda l: sum(l) / len(l)
     od = avg(draws) if draws else None
     return avg(homes), od, avg(aways), len(homes)
  
