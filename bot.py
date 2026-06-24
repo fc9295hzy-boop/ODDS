@@ -1,21 +1,19 @@
+
 # -*- coding: utf-8 -*-
 """
-Bot Telegram prive - Probabilites foot (API-Football)
------------------------------------------------------
-Tu tapes deux equipes -> % de victoire / nul / victoire,
-via l'endpoint /predictions d'API-Football.
+Bot Telegram prive - Probabilites foot (odds-api.io)
+----------------------------------------------------
+Tu tapes deux equipes -> % implicites (1/N/2) a partir des cotes
+reelles des bookmakers, pour comparer avec Polymarket.
  
-Economies :
-  - cache des IDs d'equipes (pas de re-recherche)
-  - compteur quotidien + garde-fou anti-depassement
-  - 2-3 requetes par recherche max
+Quota gratuit : 100 requetes / heure (large).
+Workflow : /v3/events (trouver le match) puis /v3/odds (cotes).
  
 Variables Railway :
-  TELEGRAM_TOKEN, OWNER_CHAT_ID, APIFOOTBALL_KEY
+  TELEGRAM_TOKEN, OWNER_CHAT_ID, ODDSAPIIO_KEY
 """
  
 import os
-import json
 import logging
 from datetime import datetime, timezone
 import requests
@@ -23,16 +21,11 @@ from telegram import Update
 from telegram.ext import (Application, CommandHandler, MessageHandler,
                           filters, ContextTypes)
  
-TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
-OWNER_CHAT_ID   = int(os.environ["OWNER_CHAT_ID"])
-APIFOOTBALL_KEY = os.environ["APIFOOTBALL_KEY"]
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+OWNER_CHAT_ID  = int(os.environ["OWNER_CHAT_ID"])
+ODDSAPIIO_KEY  = os.environ["ODDSAPIIO_KEY"]
  
-BASE_URL = "https://v3.football.api-sports.io"
-HEADERS = {"x-apisports-key": APIFOOTBALL_KEY}
- 
-DAILY_LIMIT = 100        # quota du plan gratuit
-SAFETY_STOP = 90         # on s'arrete avant pour garder une marge
-SEASON = datetime.now(timezone.utc).year   # saison courante
+BASE_URL = "https://api.odds-api.io/v3"
  
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -40,188 +33,127 @@ logging.basicConfig(
 )
 log = logging.getLogger("footbot")
  
-# --- etat persistant leger (cache equipes + compteur jour) ---
-STATE_FILE = "/tmp/footbot_state.json"
- 
-def load_state():
-    try:
-        with open(STATE_FILE) as f:
-            return json.load(f)
-    except Exception:
-        return {"teams": {}, "date": "", "count": 0}
- 
-def save_state(st):
-    try:
-        with open(STATE_FILE, "w") as f:
-            json.dump(st, f)
-    except Exception as e:
-        log.warning("save_state: %s", e)
- 
-STATE = load_state()
- 
- 
-def _today():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
- 
-def _reset_if_new_day():
-    if STATE.get("date") != _today():
-        STATE["date"] = _today()
-        STATE["count"] = 0
-        save_state(STATE)
- 
-def _can_request():
-    _reset_if_new_day()
-    return STATE["count"] < SAFETY_STOP
- 
-def _track():
-    STATE["count"] = STATE.get("count", 0) + 1
-    save_state(STATE)
- 
-def _remaining():
-    _reset_if_new_day()
-    return max(0, DAILY_LIMIT - STATE["count"])
- 
  
 def is_owner(update: Update) -> bool:
     return update.effective_chat and update.effective_chat.id == OWNER_CHAT_ID
  
  
-# ---------- Appels API ----------
-def api_get(path, params):
-    r = requests.get(f"{BASE_URL}{path}", headers=HEADERS,
-                     params=params, timeout=20)
-    _track()
+# ---------- Cotes -> probabilites ----------
+def implied_probs(oh, od, oa):
+    """Si pas de cote de nul (od=None), calcul a 2 issues."""
+    if od:
+        ih, idr, ia = 1/oh, 1/od, 1/oa
+        over = ih + idr + ia
+        return (round(ih/over*100, 1), round(idr/over*100, 1),
+                round(ia/over*100, 1), round((over-1)*100, 1))
+    ih, ia = 1/oh, 1/oa
+    over = ih + ia
+    return (round(ih/over*100, 1), None,
+            round(ia/over*100, 1), round((over-1)*100, 1))
+ 
+ 
+# ---------- Recherche du match ----------
+def get_events():
+    r = requests.get(f"{BASE_URL}/events", params={
+        "apiKey": ODDSAPIIO_KEY, "sport": "football",
+    }, timeout=25)
     r.raise_for_status()
-    data = r.json()
-    # API-Football renvoie les erreurs dans data["errors"]
-    errs = data.get("errors")
-    if errs:
-        raise RuntimeError(str(errs))
-    return data.get("response", [])
+    return r.json()
  
  
-def find_team_id(name):
-    """Cherche l'ID d'une equipe, avec cache."""
-    key = name.lower().strip()
-    cached = STATE.get("teams", {}).get(key)
-    if cached:
-        return cached
-    resp = api_get("/teams", {"search": key})
-    if not resp:
+def find_event(team_a, team_b):
+    a, b = team_a.lower().strip(), team_b.lower().strip()
+    events = get_events()
+    if isinstance(events, dict):
+        events = events.get("events", events.get("data", []))
+    for ev in events:
+        home = str(ev.get("home", "")).lower()
+        away = str(ev.get("away", "")).lower()
+        if (a in home and b in away) or (b in home and a in away):
+            return ev
+    return None
+ 
+ 
+# ---------- Cotes d'un match ----------
+def get_odds(event_id):
+    r = requests.get(f"{BASE_URL}/odds", params={
+        "apiKey": ODDSAPIIO_KEY, "eventId": event_id,
+    }, timeout=25)
+    r.raise_for_status()
+    return r.json()
+ 
+ 
+def avg_1x2(odds_json):
+    """Moyenne les cotes Match Winner (ML / 1X2) sur les bookmakers dispo."""
+    books = odds_json.get("bookmakers", {})
+    if isinstance(books, list):
+        # parfois liste au lieu de dict
+        iterator = books
+    else:
+        iterator = books.values()
+ 
+    homes, draws, aways = [], [], []
+    for book in iterator:
+        markets = book if isinstance(book, list) else book.get("markets", book)
+        # 'book' peut etre une liste de marches (format odds-api.io)
+        market_list = book if isinstance(book, list) else \
+            (book.get("markets") if isinstance(book, dict) else [])
+        if not market_list and isinstance(book, list):
+            market_list = book
+        for m in (market_list or []):
+            name = str(m.get("name", "")).upper()
+            if name in ("ML", "1X2", "MATCH WINNER", "MONEYLINE"):
+                for o in m.get("odds", []):
+                    if o.get("home"):
+                        homes.append(float(o["home"]))
+                    if o.get("draw"):
+                        draws.append(float(o["draw"]))
+                    if o.get("away"):
+                        aways.append(float(o["away"]))
+    if not (homes and aways):
         return None
-    tid = resp[0]["team"]["id"]
-    tname = resp[0]["team"]["name"]
-    STATE.setdefault("teams", {})[key] = tid
-    STATE["teams"][tname.lower()] = tid
-    save_state(STATE)
-    return tid
- 
- 
-def find_fixture(id_a, id_b):
-    """Trouve le prochain match entre deux equipes.
-    On NE passe PAS par le head-to-head (vide si elles ne se sont jamais
-    affrontees, frequent en Coupe du monde). On recupere les prochains
-    matchs de l'equipe A et on cherche celui ou B est l'adversaire.
-    Le parametre 'next' etant payant, on filtre par statut cote code."""
-    # /fixtures avec team + season : tous les matchs de l'equipe sur la saison
-    resp = api_get("/fixtures", {"team": id_a, "season": SEASON})
-    if not resp:
-        # fallback : essayer la saison precedente (chevauchement calendrier)
-        resp = api_get("/fixtures", {"team": id_a, "season": SEASON - 1})
-    if not resp:
-        return None
- 
-    candidates = []
-    for fx in resp:
-        teams = fx.get("teams", {})
-        hid = teams.get("home", {}).get("id")
-        aid = teams.get("away", {}).get("id")
-        if id_b in (hid, aid):
-            status = fx.get("fixture", {}).get("status", {}).get("short", "")
-            date_str = fx.get("fixture", {}).get("date", "")
-            try:
-                d = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-            except Exception:
-                d = None
-            candidates.append((status, d, fx))
- 
-    if not candidates:
-        return None
- 
-    # priorite aux matchs a venir (NS/TBD), le plus proche d'abord
-    upcoming = [(d, fx) for (s, d, fx) in candidates if s in ("NS", "TBD")]
-    if upcoming:
-        upcoming.sort(key=lambda x: (x[0] is None, x[0]))
-        return upcoming[0][1]
- 
-    # sinon le match le plus recent (live ou joue) pour info
-    candidates.sort(key=lambda x: (x[1] is None, x[1]), reverse=True)
-    return candidates[0][2]
- 
- 
-def get_prediction(fixture_id):
-    resp = api_get("/predictions", {"fixture": fixture_id})
-    if not resp:
-        return None
-    return resp[0]
+    avg = lambda l: sum(l)/len(l)
+    od = avg(draws) if draws else None
+    return avg(homes), od, avg(aways), len(homes)
  
  
 # ---------- Construction reponse ----------
 def build_reply(team_a, team_b):
-    if not _can_request():
-        return (f"Quota du jour bientot atteint ({STATE['count']}/{DAILY_LIMIT}).\n"
-                "Je m'arrete pour proteger ton compte. Ca repart demain.")
- 
     try:
-        ida = find_team_id(team_a)
-        idb = find_team_id(team_b)
-    except Exception as e:
-        return f"!! Erreur recherche equipe : {e}"
- 
-    if not ida:
-        return f"Equipe introuvable : {team_a}. Essaie le nom anglais (ex: Morocco)."
-    if not idb:
-        return f"Equipe introuvable : {team_b}. Essaie le nom anglais (ex: Japan)."
- 
-    try:
-        fx = find_fixture(ida, idb)
+        ev = find_event(team_a, team_b)
     except Exception as e:
         return f"!! Erreur recherche match : {e}"
-    if not fx:
+    if not ev:
         return ("Aucun match a venir trouve entre ces deux equipes.\n"
-                "Le bot ne gere que les matchs programmes (pas les hypothetiques).")
+                "Verifie l'orthographe (essaie les noms anglais).")
  
-    fid = fx["fixture"]["id"]
-    league = fx["league"]["name"]
-    date = fx["fixture"]["date"][:16].replace("T", " ")
-    home = fx["teams"]["home"]["name"]
-    away = fx["teams"]["away"]["name"]
+    home = ev.get("home", "?")
+    away = ev.get("away", "?")
+    league = ev.get("league", {})
+    league = league.get("name", "") if isinstance(league, dict) else str(league)
+    date = str(ev.get("date", ""))[:16].replace("T", " ")
+    eid = ev.get("id")
  
     try:
-        pred = get_prediction(fid)
+        odds_json = get_odds(eid)
     except Exception as e:
-        return f"!! Erreur prediction : {e}"
-    if not pred:
-        return f"Match trouve : {home} vs {away} ({league})\nPas de prediction dispo."
+        return f"!! Erreur recuperation cotes : {e}"
  
-    pct = pred.get("predictions", {}).get("percent", {})
-    p_home = pct.get("home", "?")
-    p_draw = pct.get("draw", "?")
-    p_away = pct.get("away", "?")
+    res = avg_1x2(odds_json)
+    if not res:
+        return (f"Match trouve : {home} vs {away} ({league})\n"
+                "Mais pas de cotes Match Winner dispo pour l'instant.")
  
-    advice = pred.get("predictions", {}).get("advice", "")
- 
-    msg = (
-        f"*{home} vs {away}*\n"
-        f"_{league}_  -  {date}\n\n"
-        f"{home} : *{p_home}*\n"
-        f"Nul : *{p_draw}*\n"
-        f"{away} : *{p_away}*\n"
-    )
-    if advice:
-        msg += f"\n_Conseil API : {advice}_\n"
-    msg += (f"\n-> Compare avec le prix Polymarket."
-            f"\n_Requetes today : {STATE['count']}/{DAILY_LIMIT}_")
+    oh, od, oa, nb = res
+    ph, pd, pa, marge = implied_probs(oh, od, oa)
+    msg = (f"*{home} vs {away}*\n"
+           f"_{league}_  -  {date}\n\n"
+           f"{home} : *{ph}%*  (cote {oh:.2f})\n")
+    if pd is not None:
+        msg += f"Nul : *{pd}%*  (cote {od:.2f})\n"
+    msg += (f"{away} : *{pa}%*  (cote {oa:.2f})\n\n"
+            f"_Moyenne sur {nb} bookmaker(s), marge retiree {marge}%_\n"
+            f"-> Compare avec le prix Polymarket.")
     return msg
  
  
@@ -230,18 +162,9 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
     await update.message.reply_text(
-        "Bot proba foot pret (API-Football).\n\n"
-        "Tape deux equipes :\n`France Japon`  ou  `/match France Japon`\n\n"
-        f"Quota du jour : {_remaining()}/{DAILY_LIMIT} requetes restantes.",
+        "Bot proba foot pret (odds-api.io).\n\n"
+        "Tape deux equipes :\n`France Japon`  ou  `/match France Japon`",
         parse_mode="Markdown")
- 
- 
-async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        return
-    await update.message.reply_text(
-        f"Requetes utilisees aujourd'hui : {STATE['count']}/{DAILY_LIMIT}\n"
-        f"Restantes : {_remaining()}", parse_mode="Markdown")
  
  
 async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -267,7 +190,6 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("match", handle))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
     log.info("Bot demarre (mode polling).")
