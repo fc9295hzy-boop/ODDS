@@ -118,31 +118,45 @@ def find_team_id(name):
  
  
 def find_fixture(id_a, id_b):
-    """Trouve le prochain match a venir entre deux equipes (head to head).
-    Le parametre 'next' est payant : on recupere donc le H2H et on filtre
-    le prochain match non encore joue cote code."""
-    h2h = f"{id_a}-{id_b}"
-    resp = api_get("/fixtures/headtohead", {"h2h": h2h})
+    """Trouve le prochain match entre deux equipes.
+    On NE passe PAS par le head-to-head (vide si elles ne se sont jamais
+    affrontees, frequent en Coupe du monde). On recupere les prochains
+    matchs de l'equipe A et on cherche celui ou B est l'adversaire.
+    Le parametre 'next' etant payant, on filtre par statut cote code."""
+    # /fixtures avec team + season : tous les matchs de l'equipe sur la saison
+    resp = api_get("/fixtures", {"team": id_a, "season": SEASON})
+    if not resp:
+        # fallback : essayer la saison precedente (chevauchement calendrier)
+        resp = api_get("/fixtures", {"team": id_a, "season": SEASON - 1})
     if not resp:
         return None
  
-    now = datetime.now(timezone.utc)
-    upcoming = []
+    candidates = []
     for fx in resp:
-        status = fx.get("fixture", {}).get("status", {}).get("short", "")
-        date_str = fx.get("fixture", {}).get("date", "")
-        if status in ("NS", "TBD"):
+        teams = fx.get("teams", {})
+        hid = teams.get("home", {}).get("id")
+        aid = teams.get("away", {}).get("id")
+        if id_b in (hid, aid):
+            status = fx.get("fixture", {}).get("status", {}).get("short", "")
+            date_str = fx.get("fixture", {}).get("date", "")
             try:
                 d = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
             except Exception:
                 d = None
-            upcoming.append((d, fx))
+            candidates.append((status, d, fx))
  
+    if not candidates:
+        return None
+ 
+    # priorite aux matchs a venir (NS/TBD), le plus proche d'abord
+    upcoming = [(d, fx) for (s, d, fx) in candidates if s in ("NS", "TBD")]
     if upcoming:
         upcoming.sort(key=lambda x: (x[0] is None, x[0]))
         return upcoming[0][1]
  
-    return resp[-1]
+    # sinon le match le plus recent (live ou joue) pour info
+    candidates.sort(key=lambda x: (x[1] is None, x[1]), reverse=True)
+    return candidates[0][2]
  
  
 def get_prediction(fixture_id):
