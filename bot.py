@@ -1,4 +1,3 @@
-
 # -*- coding: utf-8 -*-
 """
 Bot Telegram prive - Probabilites foot (API-Football)
@@ -119,12 +118,31 @@ def find_team_id(name):
  
  
 def find_fixture(id_a, id_b):
-    """Trouve un match a venir entre deux equipes (head to head)."""
+    """Trouve le prochain match a venir entre deux equipes (head to head).
+    Le parametre 'next' est payant : on recupere donc le H2H et on filtre
+    le prochain match non encore joue cote code."""
     h2h = f"{id_a}-{id_b}"
-    resp = api_get("/fixtures/headtohead", {"h2h": h2h, "next": 1})
-    if resp:
-        return resp[0]
-    return None
+    resp = api_get("/fixtures/headtohead", {"h2h": h2h})
+    if not resp:
+        return None
+ 
+    now = datetime.now(timezone.utc)
+    upcoming = []
+    for fx in resp:
+        status = fx.get("fixture", {}).get("status", {}).get("short", "")
+        date_str = fx.get("fixture", {}).get("date", "")
+        if status in ("NS", "TBD"):
+            try:
+                d = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+            except Exception:
+                d = None
+            upcoming.append((d, fx))
+ 
+    if upcoming:
+        upcoming.sort(key=lambda x: (x[0] is None, x[0]))
+        return upcoming[0][1]
+ 
+    return resp[-1]
  
  
 def get_prediction(fixture_id):
