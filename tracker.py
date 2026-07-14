@@ -1,3 +1,4 @@
+
 # -*- coding: utf-8 -*-
 """
 tracker.py - Poll continu + detection de steam move (foot et tennis SEPARES)
@@ -22,7 +23,7 @@ from datetime import datetime, timezone
  
 from telegram import Bot
  
-from storage import init_db, save_snapshot, get_history, list_tracked_matches
+from storage import init_db, save_snapshot, get_history, list_tracked_matches, remove_tracked_match
 from bot import find_event, get_odds  # reutilise les fonctions existantes de bot.py
  
 logging.basicConfig(
@@ -135,6 +136,24 @@ async def process_match(cfg, team_a, team_b):
     if not event:
         log.warning(f"[{sport}] Match introuvable: {team_a} vs {team_b}")
         return
+ 
+    # ---- Arret automatique si le coup d'envoi est deja passe ----
+    # Evite de continuer a consommer le quota API sur un match qui a demarre :
+    # le steam move sur les cotes n'a plus de sens une fois le match en cours
+    # (les books passent en mode live, logique totalement differente).
+    kickoff_str = event.get("date", "")
+    try:
+        kickoff = datetime.fromisoformat(kickoff_str.replace("Z", "+00:00"))
+        if datetime.now(timezone.utc) >= kickoff:
+            remove_tracked_match(sport, team_a, team_b)
+            log.info(f"[{sport}] {team_a} vs {team_b} : coup d'envoi passe, "
+                      f"suivi arrete automatiquement.")
+            await send_alert(sport, f"Suivi arrete (coup d'envoi passe) : "
+                                     f"{event.get('home')} vs {event.get('away')}")
+            return
+    except (ValueError, TypeError):
+        # Si la date est illisible, on ne bloque pas le suivi pour autant
+        log.warning(f"[{sport}] Date illisible pour {team_a} vs {team_b}: {kickoff_str!r}")
  
     try:
         odds_json = get_odds(event["id"])
