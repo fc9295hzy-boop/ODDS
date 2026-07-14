@@ -1,179 +1,206 @@
-
 # -*- coding: utf-8 -*-
 """
-storage.py - Historisation des cotes par bookmaker (foot ET tennis, pipelines separes)
+tracker.py - Poll continu + detection de steam move (foot et tennis SEPARES)
 ----------------------------------------------------------------------
-Contrairement a oddyoddy actuel (stateless, snapshot a la demande), ce module
-garde une trace de CHAQUE cote individuelle par bookmaker dans le temps,
-pour pouvoir calculer des deltas et detecter des steam moves.
+Deux pipelines independants (config, seuils, listes de matchs suivis) :
+FOOT_CONFIG et TENNIS_CONFIG ne se melangent jamais dans l'analyse.
+Chaque sport a ses propres seuils de detection, calibres a sa liquidite.
  
-IMPORTANT - Persistence sur Railway :
-Le filesystem Railway est ephemere par defaut (reset a chaque redeploy).
-Pour garder l'historique, il faut soit :
-  a) Monter un Volume Railway sur le dossier contenant odds_history.db
-  b) Passer sur Postgres (addon Railway, quelques clics)
-Tant que ce n'est pas fait, l'historique repart a zero a chaque deploy.
- 
-Schema : une ligne = une cote d'UN bookmaker sur UN marche a UN instant T.
-On ne stocke jamais la moyenne : la moyenne, on la recalcule a la demande.
+Logique :
+1. Toutes les X secondes, pour chaque match suivi -> save_snapshot()
+2. Calcul du delta par bookmaker vs la cote d'il y a N minutes
+3. Si >= 2 bookmakers bougent dans le meme sens au-dela du seuil -> steam move -> alerte Telegram
+4. Si un seul book bouge alors que les autres non -> divergence isolee -> alerte plus discrete
+   (potentiel sharp qui a bouge en premier, ou book en retard)
 """
  
 import os
-import sqlite3
-from datetime import datetime, timezone, timedelta
-from contextlib import contextmanager
+import time
+import logging
+import asyncio
+from datetime import datetime, timezone
  
-DB_PATH = os.environ.get("DB_PATH", "odds_history.db")
+from telegram import Bot
  
+from storage import init_db, save_snapshot, get_history, list_tracked_matches
+from bot import find_event, get_odds  # reutilise les fonctions existantes de bot.py
  
-@contextmanager
-def get_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger("tracker")
  
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+OWNER_CHAT_ID = int(os.environ["OWNER_CHAT_ID"])
+bot = Bot(token=TELEGRAM_TOKEN)
  
-def init_db():
-    with get_conn() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS odds_snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts TEXT NOT NULL,
-                sport TEXT NOT NULL,
-                event_id TEXT NOT NULL,
-                home TEXT NOT NULL,
-                away TEXT NOT NULL,
-                bookmaker TEXT NOT NULL,
-                odds_home REAL NOT NULL,
-                odds_draw REAL,
-                odds_away REAL NOT NULL,
-                implied_home REAL NOT NULL,
-                implied_draw REAL,
-                implied_away REAL NOT NULL,
-                margin_pct REAL NOT NULL
-            )
-        """)
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_event_book_ts
-            ON odds_snapshots (sport, event_id, bookmaker, ts)
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS tracked_matches (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                sport TEXT NOT NULL,
-                team_a TEXT NOT NULL,
-                team_b TEXT NOT NULL,
-                added_ts TEXT NOT NULL,
-                UNIQUE(sport, team_a, team_b)
-            )
-        """)
+# ---------- Config par sport - JAMAIS partagee entre les deux ----------
+FOOT_CONFIG = {
+    "sport": "football",
+    "poll_interval_sec": 900,       # 15 min par defaut
+    "poll_interval_close_sec": 120, # 2 min dans la fenetre serree pre-match
+    "close_window_min": 180,        # "pre-match serre" = 3h avant coup d'envoi
+    "delta_window_min": 30,         # compare vs il y a 30 min
+    "steam_threshold_pct": 3.0,     # 3% de mouvement sur la proba implicite
+    "min_books_for_steam": 2,       # au moins 2 books doivent bouger ensemble
+    # Plus de liste "matches" en dur ici : lue depuis la DB a chaque cycle,
+    # geree via /track /untrack /tracked sur Telegram.
+}
+ 
+TENNIS_CONFIG = {
+    "sport": "tennis",
+    "poll_interval_sec": 600,       # 10 min (matchs plus courts a suivre)
+    "poll_interval_close_sec": 60,  # 1 min dans la fenetre serree pre-match
+    "close_window_min": 90,         # tennis = fenetre serree plus courte
+    "delta_window_min": 20,
+    "steam_threshold_pct": 4.0,     # seuil plus haut : moins de books, plus de bruit
+    "min_books_for_steam": 2,
+    # Plus de liste "matches" en dur ici : lue depuis la DB a chaque cycle.
+}
  
  
-def add_tracked_match(sport, team_a, team_b):
-    """Ajoute un match a suivre. Ignore silencieusement si deja present."""
-    now = datetime.now(timezone.utc).isoformat()
-    with get_conn() as conn:
-        conn.execute("""
-            INSERT OR IGNORE INTO tracked_matches (sport, team_a, team_b, added_ts)
-            VALUES (?, ?, ?, ?)
-        """, (sport, team_a, team_b, now))
- 
- 
-def remove_tracked_match(sport, team_a, team_b):
-    """Retourne True si un match a bien ete supprime."""
-    with get_conn() as conn:
-        cur = conn.execute("""
-            DELETE FROM tracked_matches WHERE sport = ? AND team_a = ? AND team_b = ?
-        """, (sport, team_a, team_b))
-        return cur.rowcount > 0
- 
- 
-def list_tracked_matches(sport=None):
-    query = "SELECT * FROM tracked_matches"
-    params = []
-    if sport:
-        query += " WHERE sport = ?"
-        params.append(sport)
-    query += " ORDER BY added_ts DESC"
-    with get_conn() as conn:
-        return [dict(r) for r in conn.execute(query, params).fetchall()]
- 
- 
-def _implied(oh, od, oa):
-    """Meme logique que implied_probs() dans bot.py, mais par book individuel."""
-    if od:
-        ih, idr, ia = 1/oh, 1/od, 1/oa
-        over = ih + idr + ia
-        return ih/over, idr/over, ia/over, (over - 1) * 100
-    ih, ia = 1/oh, 1/oa
-    over = ih + ia
-    return ih/over, None, ia/over, (over - 1) * 100
- 
- 
-def save_snapshot(sport, event, odds_json):
+def compute_deltas(sport, event_id, delta_window_min):
     """
-    Parcourt les cotes ML de chaque bookmaker individuellement et les stocke.
-    sport: "football" ou "tennis"
-    event: dict retourne par find_event() (home, away, id, ...)
-    odds_json: dict retourne par get_odds()
-    Retourne le nombre de lignes inserees.
+    Pour chaque bookmaker ayant des donnees sur ce match, compare la derniere
+    cote connue vs celle d'il y a `delta_window_min` minutes.
+    Retourne une liste de dicts {bookmaker, delta_home_pct, delta_away_pct, direction}.
     """
-    books = odds_json.get("bookmakers", {})
-    if not isinstance(books, dict):
-        return 0
+    history = get_history(sport, event_id, since_minutes=delta_window_min + 5)
+    if not history:
+        return []
  
-    now = datetime.now(timezone.utc).isoformat()
-    home, away, event_id = event.get("home", "?"), event.get("away", "?"), str(event.get("id"))
-    rows = []
+    by_book = {}
+    for row in history:
+        by_book.setdefault(row["bookmaker"], []).append(row)
  
-    for book_name, markets in books.items():
-        if not isinstance(markets, list):
+    results = []
+    for book, rows in by_book.items():
+        rows.sort(key=lambda r: r["ts"])
+        if len(rows) < 2:
             continue
-        for m in markets:
-            if str(m.get("name", "")).upper() != "ML":
-                continue
-            for o in m.get("odds", []):
-                try:
-                    oh = float(o["home"]) if o.get("home") else None
-                    od = float(o["draw"]) if o.get("draw") else None
-                    oa = float(o["away"]) if o.get("away") else None
-                except (ValueError, TypeError):
-                    continue
-                if not (oh and oa):
-                    continue
-                ih, idr, ia, margin = _implied(oh, od, oa)
-                rows.append((now, sport, event_id, home, away, book_name,
-                             oh, od, oa, ih, idr, ia, margin))
- 
-    if not rows:
-        return 0
- 
-    with get_conn() as conn:
-        conn.executemany("""
-            INSERT INTO odds_snapshots
-            (ts, sport, event_id, home, away, bookmaker,
-             odds_home, odds_draw, odds_away, implied_home, implied_draw, implied_away, margin_pct)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, rows)
-    return len(rows)
+        first, last = rows[0], rows[-1]
+        delta_home = (last["implied_home"] - first["implied_home"]) * 100
+        delta_away = (last["implied_away"] - first["implied_away"]) * 100
+        results.append({
+            "bookmaker": book,
+            "delta_home_pct": round(delta_home, 2),
+            "delta_away_pct": round(delta_away, 2),
+            "first_ts": first["ts"],
+            "last_ts": last["ts"],
+            "home": last["home"],
+            "away": last["away"],
+        })
+    return results
  
  
-def get_history(sport, event_id, bookmaker=None, since_minutes=None):
-    """Recupere l'historique brut, filtre optionnel par book et par fenetre temporelle."""
-    query = "SELECT * FROM odds_snapshots WHERE sport = ? AND event_id = ?"
-    params = [sport, str(event_id)]
-    if bookmaker:
-        query += " AND bookmaker = ?"
-        params.append(bookmaker)
-    if since_minutes:
-        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=since_minutes)).isoformat()
-        query += " AND ts >= ?"
-        params.append(cutoff)
-    query += " ORDER BY ts ASC"
+def detect_steam(deltas, threshold_pct, min_books):
+    """
+    Regarde si plusieurs books bougent dans le meme sens au-dela du seuil.
+    Retourne (is_steam, direction, books_concernes) ou (False, None, []).
+    """
+    movers_home = [d for d in deltas if d["delta_home_pct"] >= threshold_pct]
+    movers_away = [d for d in deltas if d["delta_away_pct"] >= threshold_pct]
  
-    with get_conn() as conn:
-        return [dict(r) for r in conn.execute(query, params).fetchall()]
+    if len(movers_home) >= min_books:
+        return True, "home", movers_home
+    if len(movers_away) >= min_books:
+        return True, "away", movers_away
+    return False, None, []
+ 
+ 
+def detect_isolated_divergence(deltas, threshold_pct):
+    """Un seul book bouge fort pendant que les autres sont stables -> a signaler,
+    signal plus faible qu'un steam mais utile (sharp book en avance, ou book en retard)."""
+    strong_movers = [d for d in deltas
+                      if abs(d["delta_home_pct"]) >= threshold_pct
+                      or abs(d["delta_away_pct"]) >= threshold_pct]
+    if len(strong_movers) == 1:
+        return strong_movers[0]
+    return None
+ 
+ 
+async def send_alert(sport, msg):
+    prefix = "⚽" if sport == "football" else "🎾"
+    await bot.send_message(chat_id=OWNER_CHAT_ID, text=f"{prefix} {msg}", parse_mode="Markdown")
+ 
+ 
+async def process_match(cfg, team_a, team_b):
+    sport = cfg["sport"]
+    try:
+        event = find_event(team_a, team_b, sport)
+    except Exception as e:
+        log.error(f"[{sport}] Erreur recherche {team_a} vs {team_b}: {e}")
+        return
+    if not event:
+        log.warning(f"[{sport}] Match introuvable: {team_a} vs {team_b}")
+        return
+ 
+    try:
+        odds_json = get_odds(event["id"])
+    except Exception as e:
+        log.error(f"[{sport}] Erreur cotes {team_a} vs {team_b}: {e}")
+        return
+ 
+    n = save_snapshot(sport, event, odds_json)
+    log.info(f"[{sport}] Snapshot {event['home']} vs {event['away']}: {n} lignes stockees")
+ 
+    deltas = compute_deltas(sport, str(event["id"]), cfg["delta_window_min"])
+    if not deltas:
+        return
+ 
+    is_steam, direction, books = detect_steam(deltas, cfg["steam_threshold_pct"], cfg["min_books_for_steam"])
+    if is_steam:
+        side = event["home"] if direction == "home" else event["away"]
+        book_names = ", ".join(d["bookmaker"] for d in books)
+        avg_delta = sum(d[f"delta_{direction}_pct"] for d in books) / len(books)
+        msg = (f"*STEAM MOVE* : {event['home']} vs {event['away']}\n"
+               f"Mouvement vers *{side}* : +{avg_delta:.1f}% sur {len(books)} books ({book_names})\n"
+               f"Fenetre : {cfg['delta_window_min']} min")
+        await send_alert(sport, msg)
+        return
+ 
+    isolated = detect_isolated_divergence(deltas, cfg["steam_threshold_pct"])
+    if isolated:
+        msg = (f"*Divergence isolee* : {event['home']} vs {event['away']}\n"
+               f"{isolated['bookmaker']} seul a bouger : "
+               f"home {isolated['delta_home_pct']:+.1f}% / away {isolated['delta_away_pct']:+.1f}%\n"
+               f"(sharp en avance, ou book en retard sur le marche)")
+        await send_alert(sport, msg)
+ 
+ 
+async def run_pipeline(cfg):
+    """Boucle infinie pour un sport donne. Relit la liste des matchs suivis
+    depuis la DB a CHAQUE cycle -> /track et /untrack prennent effet
+    immediatement, sans redeploy."""
+    while True:
+        tracked = list_tracked_matches(cfg["sport"])
+        if not tracked:
+            log.info(f"[{cfg['sport']}] Aucun match suivi actuellement.")
+        for row in tracked:
+            await process_match(cfg, row["team_a"], row["team_b"])
+        # TODO: rendre l'intervalle adaptatif (poll_interval_close_sec) une fois
+        # qu'on croise avec l'heure de coup d'envoi de chaque match (cf. event["date"])
+        await asyncio.sleep(cfg["poll_interval_sec"])
+ 
+ 
+async def start_tracking():
+    """
+    Point d'entree appele depuis bot.py pour lancer les pipelines en tache de fond,
+    DANS LE MEME PROCESS que le bot Telegram (1 seul service Railway = budget respecte).
+    N'est PAS bloquant : cree des asyncio.Task et retourne immediatement.
+    Les matchs suivis sont geres via /track /untrack /tracked sur Telegram,
+    pas besoin de config en dur ni de redeploy.
+    """
+    init_db()
+    log.info("DB initialisee, demarrage des pipelines foot + tennis (separes).")
+    asyncio.create_task(run_pipeline(FOOT_CONFIG))
+    asyncio.create_task(run_pipeline(TENNIS_CONFIG))
+ 
+ 
+# Lancement autonome possible pour tester tracker.py seul en local, hors Railway.
+if __name__ == "__main__":
+    async def _standalone():
+        await start_tracking()
+        await asyncio.Event().wait()  # bloque indefiniment
+    asyncio.run(_standalone())
