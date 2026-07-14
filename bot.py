@@ -1,10 +1,13 @@
 
 # -*- coding: utf-8 -*-
 """
-Bot Telegram prive - Probabilites foot (odds-api.io)
+Bot Telegram prive - Probabilites foot + tennis (odds-api.io)
 ----------------------------------------------------
-Tu tapes deux equipes -> % implicites (1/N/2) a partir des cotes
-reelles des bookmakers, pour comparer avec Polymarket.
+Tu tapes deux equipes/joueurs -> % implicites (1/N/2 ou 1/2) a partir des
+cotes reelles des bookmakers, pour comparer avec Polymarket.
+ 
+Foot   : `France Japon`            ou  `/match France Japon`
+Tennis : `tennis Alcaraz Sinner`   ou  `/tennis Alcaraz Sinner`
  
 Quota gratuit : 100 requetes / heure (large).
 Workflow : /v3/events (trouver le match) puis /v3/odds (cotes).
@@ -43,7 +46,8 @@ def is_owner(update: Update) -> bool:
  
 # ---------- Cotes -> probabilites ----------
 def implied_probs(oh, od, oa):
-    """Si pas de cote de nul (od=None), calcul a 2 issues."""
+    """Si pas de cote de nul (od=None), calcul a 2 issues.
+    Le tennis n'a jamais de nul -> passe toujours par cette branche."""
     if od:
         ih, idr, ia = 1/oh, 1/od, 1/oa
         over = ih + idr + ia
@@ -56,17 +60,17 @@ def implied_probs(oh, od, oa):
  
  
 # ---------- Recherche du match ----------
-def get_events():
+def get_events(sport="football"):
     r = requests.get(f"{BASE_URL}/events", params={
-        "apiKey": ODDSAPIIO_KEY, "sport": "football",
+        "apiKey": ODDSAPIIO_KEY, "sport": sport,
     }, timeout=25)
     r.raise_for_status()
     return r.json()
  
  
-def find_event(team_a, team_b):
+def find_event(team_a, team_b, sport="football"):
     a, b = team_a.lower().strip(), team_b.lower().strip()
-    events = get_events()
+    events = get_events(sport)
     if isinstance(events, dict):
         events = events.get("events", events.get("data", []))
     for ev in events:
@@ -91,7 +95,8 @@ def avg_1x2(odds_json):
     """Moyenne les cotes ML (Match Winner) sur les bookmakers dispo.
     Structure odds-api.io confirmee :
       odds_json['bookmakers'] = { 'Bet365': [ {'name':'ML',
-          'odds':[{'home','draw','away'}] }, ... ], ... }"""
+          'odds':[{'home','draw','away'}] }, ... ], ... }
+    En tennis, 'draw' est simplement absent -> geree nativement."""
     books = odds_json.get("bookmakers", {})
     if not isinstance(books, dict):
         return None
@@ -120,13 +125,14 @@ def avg_1x2(odds_json):
  
  
 # ---------- Construction reponse ----------
-def build_reply(team_a, team_b):
+def build_reply(name_a, name_b, sport="football"):
+    label = "match" if sport == "football" else "joueurs"
     try:
-        ev = find_event(team_a, team_b)
+        ev = find_event(name_a, name_b, sport)
     except Exception as e:
-        return f"!! Erreur recherche match : {e}"
+        return f"!! Erreur recherche {label} : {e}"
     if not ev:
-        return ("Aucun match a venir trouve entre ces deux equipes.\n"
+        return (f"Aucun {label} a venir trouve entre ces deux {label}.\n"
                 "Verifie l'orthographe (essaie les noms anglais).")
  
     home = ev.get("home", "?")
@@ -143,7 +149,7 @@ def build_reply(team_a, team_b):
  
     res = avg_1x2(odds_json)
     if not res:
-        return (f"Match trouve : {home} vs {away} ({league})\n"
+        return (f"{label.capitalize()} trouve : {home} vs {away} ({league})\n"
                 "Mais pas de cotes Match Winner dispo pour l'instant.")
  
     oh, od, oa, nb = res
@@ -159,20 +165,8 @@ def build_reply(team_a, team_b):
     return msg
  
  
-# ---------- Handlers ----------
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        return
-    await update.message.reply_text(
-        "Bot proba foot pret (odds-api.io).\n\n"
-        "Tape deux equipes :\n`France Japon`  ou  `/match France Japon`",
-        parse_mode="Markdown")
- 
- 
-async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        return
-    text = (update.message.text or "").replace("/match", "").strip()
+# ---------- Parsing texte libre en deux noms ----------
+def split_two_names(text):
     parts = None
     for sep in (" vs ", " VS ", " - ", " / ", "-"):
         if sep in text:
@@ -181,19 +175,79 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if parts is None:
         parts = text.split(None, 1)
     if len(parts) < 2 or not parts[0].strip() or not parts[1].strip():
+        return None
+    return parts[0].strip(), parts[1].strip()
+ 
+ 
+# ---------- Handlers ----------
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+    await update.message.reply_text(
+        "Bot proba foot + tennis pret (odds-api.io).\n\n"
+        "Foot   : `France Japon`  ou  `/match France Japon`\n"
+        "Tennis : `tennis Alcaraz Sinner`  ou  `/tennis Alcaraz Sinner`",
+        parse_mode="Markdown")
+ 
+ 
+async def handle_match(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Foot uniquement, via /match."""
+    if not is_owner(update):
+        return
+    text = (update.message.text or "").replace("/match", "").strip()
+    names = split_two_names(text)
+    if not names:
         await update.message.reply_text(
             "Donne-moi deux equipes. Ex : `France Japon`", parse_mode="Markdown")
         return
     await update.message.reply_text("Je cherche...")
-    reply = build_reply(parts[0].strip(), parts[1].strip())
+    reply = build_reply(*names, sport="football")
+    await update.message.reply_text(reply, parse_mode="Markdown")
+ 
+ 
+async def handle_tennis(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Tennis uniquement, via /tennis."""
+    if not is_owner(update):
+        return
+    text = (update.message.text or "").replace("/tennis", "").strip()
+    names = split_two_names(text)
+    if not names:
+        await update.message.reply_text(
+            "Donne-moi deux joueurs. Ex : `Alcaraz Sinner`", parse_mode="Markdown")
+        return
+    await update.message.reply_text("Je cherche...")
+    reply = build_reply(*names, sport="tennis")
+    await update.message.reply_text(reply, parse_mode="Markdown")
+ 
+ 
+async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Texte libre : prefixe 'tennis ' -> tennis, sinon foot par defaut."""
+    if not is_owner(update):
+        return
+    text = (update.message.text or "").strip()
+ 
+    sport = "football"
+    if text.lower().startswith("tennis"):
+        sport = "tennis"
+        text = text[len("tennis"):].strip()
+ 
+    names = split_two_names(text)
+    if not names:
+        await update.message.reply_text(
+            "Donne-moi deux noms. Ex : `France Japon` ou `tennis Alcaraz Sinner`",
+            parse_mode="Markdown")
+        return
+    await update.message.reply_text("Je cherche...")
+    reply = build_reply(*names, sport=sport)
     await update.message.reply_text(reply, parse_mode="Markdown")
  
  
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("match", handle))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
+    app.add_handler(CommandHandler("match", handle_match))
+    app.add_handler(CommandHandler("tennis", handle_tennis))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     log.info("Bot demarre (mode polling).")
     app.run_polling()
  
