@@ -149,6 +149,14 @@ def build_reply(name_a, name_b, sport="football"):
  
     res = avg_1x2(odds_json)
     if not res:
+        books = odds_json.get("bookmakers", {})
+        available_markets = set()
+        for book_name, markets in books.items():
+            if isinstance(markets, list):
+                for m in markets:
+                    available_markets.add(f"{book_name}:{m.get('name')}")
+        log.info(f"Pas de ML trouve pour {home} vs {away}. "
+                 f"Marches bruts recus : {available_markets or 'aucun bookmaker'}")
         return (f"{label.capitalize()} trouve : {home} vs {away} ({league})\n"
                 "Mais pas de cotes Match Winner dispo pour l'instant.")
  
