@@ -1,4 +1,3 @@
-
 # -*- coding: utf-8 -*-
 """
 Bot Telegram prive - Probabilites foot + tennis (odds-api.io)
@@ -242,8 +241,23 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(reply, parse_mode="Markdown")
  
  
+async def post_init(app: Application):
+    """
+    Appele automatiquement par PTB une fois le bot demarre.
+    Lance le tracker (steam move detection) EN TACHE DE FOND, dans ce meme
+    process/service Railway -> pas de 2e service, budget $5/mois respecte.
+    Import local pour eviter un import circulaire (tracker.py importe bot.py).
+    """
+    try:
+        from tracker import start_tracking
+        await start_tracking()
+        log.info("Tracker foot+tennis demarre en tache de fond.")
+    except Exception as e:
+        log.error(f"Impossible de demarrer le tracker : {e}")
+ 
+ 
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("match", handle_match))
     app.add_handler(CommandHandler("tennis", handle_tennis))
