@@ -1,3 +1,4 @@
+
 # -*- coding: utf-8 -*-
 """
 storage.py - Historisation des cotes par bookmaker (foot ET tennis, pipelines separes)
@@ -5,26 +6,26 @@ storage.py - Historisation des cotes par bookmaker (foot ET tennis, pipelines se
 Contrairement a oddyoddy actuel (stateless, snapshot a la demande), ce module
 garde une trace de CHAQUE cote individuelle par bookmaker dans le temps,
 pour pouvoir calculer des deltas et detecter des steam moves.
-
+ 
 IMPORTANT - Persistence sur Railway :
 Le filesystem Railway est ephemere par defaut (reset a chaque redeploy).
 Pour garder l'historique, il faut soit :
   a) Monter un Volume Railway sur le dossier contenant odds_history.db
   b) Passer sur Postgres (addon Railway, quelques clics)
 Tant que ce n'est pas fait, l'historique repart a zero a chaque deploy.
-
+ 
 Schema : une ligne = une cote d'UN bookmaker sur UN marche a UN instant T.
 On ne stocke jamais la moyenne : la moyenne, on la recalcule a la demande.
 """
-
+ 
 import os
 import sqlite3
 from datetime import datetime, timezone, timedelta
 from contextlib import contextmanager
-
+ 
 DB_PATH = os.environ.get("DB_PATH", "odds_history.db")
-
-
+ 
+ 
 @contextmanager
 def get_conn():
     conn = sqlite3.connect(DB_PATH)
@@ -34,8 +35,8 @@ def get_conn():
         conn.commit()
     finally:
         conn.close()
-
-
+ 
+ 
 def init_db():
     with get_conn() as conn:
         conn.execute("""
@@ -60,8 +61,48 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_event_book_ts
             ON odds_snapshots (sport, event_id, bookmaker, ts)
         """)
-
-
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS tracked_matches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sport TEXT NOT NULL,
+                team_a TEXT NOT NULL,
+                team_b TEXT NOT NULL,
+                added_ts TEXT NOT NULL,
+                UNIQUE(sport, team_a, team_b)
+            )
+        """)
+ 
+ 
+def add_tracked_match(sport, team_a, team_b):
+    """Ajoute un match a suivre. Ignore silencieusement si deja present."""
+    now = datetime.now(timezone.utc).isoformat()
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT OR IGNORE INTO tracked_matches (sport, team_a, team_b, added_ts)
+            VALUES (?, ?, ?, ?)
+        """, (sport, team_a, team_b, now))
+ 
+ 
+def remove_tracked_match(sport, team_a, team_b):
+    """Retourne True si un match a bien ete supprime."""
+    with get_conn() as conn:
+        cur = conn.execute("""
+            DELETE FROM tracked_matches WHERE sport = ? AND team_a = ? AND team_b = ?
+        """, (sport, team_a, team_b))
+        return cur.rowcount > 0
+ 
+ 
+def list_tracked_matches(sport=None):
+    query = "SELECT * FROM tracked_matches"
+    params = []
+    if sport:
+        query += " WHERE sport = ?"
+        params.append(sport)
+    query += " ORDER BY added_ts DESC"
+    with get_conn() as conn:
+        return [dict(r) for r in conn.execute(query, params).fetchall()]
+ 
+ 
 def _implied(oh, od, oa):
     """Meme logique que implied_probs() dans bot.py, mais par book individuel."""
     if od:
@@ -71,8 +112,8 @@ def _implied(oh, od, oa):
     ih, ia = 1/oh, 1/oa
     over = ih + ia
     return ih/over, None, ia/over, (over - 1) * 100
-
-
+ 
+ 
 def save_snapshot(sport, event, odds_json):
     """
     Parcourt les cotes ML de chaque bookmaker individuellement et les stocke.
@@ -84,11 +125,11 @@ def save_snapshot(sport, event, odds_json):
     books = odds_json.get("bookmakers", {})
     if not isinstance(books, dict):
         return 0
-
+ 
     now = datetime.now(timezone.utc).isoformat()
     home, away, event_id = event.get("home", "?"), event.get("away", "?"), str(event.get("id"))
     rows = []
-
+ 
     for book_name, markets in books.items():
         if not isinstance(markets, list):
             continue
@@ -107,10 +148,10 @@ def save_snapshot(sport, event, odds_json):
                 ih, idr, ia, margin = _implied(oh, od, oa)
                 rows.append((now, sport, event_id, home, away, book_name,
                              oh, od, oa, ih, idr, ia, margin))
-
+ 
     if not rows:
         return 0
-
+ 
     with get_conn() as conn:
         conn.executemany("""
             INSERT INTO odds_snapshots
@@ -119,8 +160,8 @@ def save_snapshot(sport, event, odds_json):
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, rows)
     return len(rows)
-
-
+ 
+ 
 def get_history(sport, event_id, bookmaker=None, since_minutes=None):
     """Recupere l'historique brut, filtre optionnel par book et par fenetre temporelle."""
     query = "SELECT * FROM odds_snapshots WHERE sport = ? AND event_id = ?"
@@ -133,6 +174,6 @@ def get_history(sport, event_id, bookmaker=None, since_minutes=None):
         query += " AND ts >= ?"
         params.append(cutoff)
     query += " ORDER BY ts ASC"
-
+ 
     with get_conn() as conn:
         return [dict(r) for r in conn.execute(query, params).fetchall()]
