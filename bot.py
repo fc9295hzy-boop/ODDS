@@ -1,3 +1,4 @@
+
 # -*- coding: utf-8 -*-
 """
 Bot Telegram prive - Probabilites foot + tennis (odds-api.io)
@@ -185,7 +186,11 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Bot proba foot + tennis pret (odds-api.io).\n\n"
         "Foot   : `France Japon`  ou  `/match France Japon`\n"
-        "Tennis : `tennis Alcaraz Sinner`  ou  `/tennis Alcaraz Sinner`",
+        "Tennis : `tennis Alcaraz Sinner`  ou  `/tennis Alcaraz Sinner`\n\n"
+        "Suivi steam move :\n"
+        "`/track foot France Espagne`\n"
+        "`/untrack foot France Espagne`\n"
+        "`/tracked` - liste les matchs suivis",
         parse_mode="Markdown")
  
  
@@ -256,11 +261,84 @@ async def post_init(app: Application):
         log.error(f"Impossible de demarrer le tracker : {e}")
  
  
+async def handle_track(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/track foot France Espagne   ou   /track tennis Alcaraz Sinner"""
+    if not is_owner(update):
+        return
+    text = (update.message.text or "").replace("/track", "").strip()
+    tokens = text.split(None, 1)
+    if len(tokens) < 2 or tokens[0].lower() not in ("foot", "tennis"):
+        await update.message.reply_text(
+            "Usage : `/track foot France Espagne` ou `/track tennis Alcaraz Sinner`",
+            parse_mode="Markdown")
+        return
+    sport = "football" if tokens[0].lower() == "foot" else "tennis"
+    names = split_two_names(tokens[1])
+    if not names:
+        await update.message.reply_text("Donne-moi deux noms apres le sport.")
+        return
+ 
+    from storage import add_tracked_match
+    add_tracked_match(sport, *names)
+    await update.message.reply_text(
+        f"Ajoute au suivi ({tokens[0].lower()}) : {names[0]} vs {names[1]}\n"
+        f"Pris en compte au prochain cycle de poll, pas besoin de redeploy.")
+ 
+ 
+async def handle_untrack(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/untrack foot France Espagne"""
+    if not is_owner(update):
+        return
+    text = (update.message.text or "").replace("/untrack", "").strip()
+    tokens = text.split(None, 1)
+    if len(tokens) < 2 or tokens[0].lower() not in ("foot", "tennis"):
+        await update.message.reply_text(
+            "Usage : `/untrack foot France Espagne`", parse_mode="Markdown")
+        return
+    sport = "football" if tokens[0].lower() == "foot" else "tennis"
+    names = split_two_names(tokens[1])
+    if not names:
+        await update.message.reply_text("Donne-moi deux noms apres le sport.")
+        return
+ 
+    from storage import remove_tracked_match
+    removed = remove_tracked_match(sport, *names)
+    if removed:
+        await update.message.reply_text(f"Retire du suivi : {names[0]} vs {names[1]}")
+    else:
+        await update.message.reply_text("Ce match n'etait pas dans la liste de suivi.")
+ 
+ 
+async def handle_tracked(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/tracked - liste tous les matchs actuellement suivis"""
+    if not is_owner(update):
+        return
+    from storage import list_tracked_matches
+    foot = list_tracked_matches("football")
+    tennis = list_tracked_matches("tennis")
+ 
+    if not foot and not tennis:
+        await update.message.reply_text("Aucun match suivi actuellement.")
+        return
+ 
+    lines = []
+    if foot:
+        lines.append("*Foot :*")
+        lines += [f"  - {m['team_a']} vs {m['team_b']}" for m in foot]
+    if tennis:
+        lines.append("*Tennis :*")
+        lines += [f"  - {m['team_a']} vs {m['team_b']}" for m in tennis]
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+ 
+ 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("match", handle_match))
     app.add_handler(CommandHandler("tennis", handle_tennis))
+    app.add_handler(CommandHandler("track", handle_track))
+    app.add_handler(CommandHandler("untrack", handle_untrack))
+    app.add_handler(CommandHandler("tracked", handle_tracked))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     log.info("Bot demarre (mode polling).")
     app.run_polling()
